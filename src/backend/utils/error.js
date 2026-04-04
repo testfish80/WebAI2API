@@ -21,8 +21,8 @@ export function isRetryableError(errorMessage) {
     const retryablePatterns = [
         // 网络错误
         /network|net::|econnreset|econnrefused|etimedout/i,
-        // 超时
-        /timeout|timed out/i,
+        // 超时（含中文）
+        /timeout|timed out|加载超时|请求超时/i,
         // 页面崩溃
         /crashed|crash/i,
         // 5xx 服务端错误
@@ -62,6 +62,11 @@ export function normalizePageError(err, meta = {}) {
         const timeoutMsg = err.message.replace('API_TIMEOUT: ', '');
         logger.error('适配器', timeoutMsg, meta);
         return { error: timeoutMsg, code: ADAPTER_ERRORS.TIMEOUT_ERROR, retryable: true };
+    }
+    // 页面加载超时 (gotoWithCheck 抛出的中文超时错误)
+    if (err.message?.includes('页面加载超时') || err.message?.includes('页面加载失败')) {
+        logger.error('适配器', err.message, meta);
+        return { error: err.message, code: ADAPTER_ERRORS.TIMEOUT_ERROR, retryable: true };
     }
     // 兼容原生 TimeoutError (其他地方抛出的)
     if (err.name === 'TimeoutError' || err.message?.includes('Timeout')) {

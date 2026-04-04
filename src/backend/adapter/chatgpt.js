@@ -110,12 +110,79 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             return { error: `API 返回错误: HTTP ${conversationResponse.status()}` };
         }
 
+        // 5.5 解析 conversation 响应，检查是否是纯文本回复（拒绝/限流场景）
+        let conversationText = '';
+        let isImageGenerationStarted = false;
+        let conversationBody = '';
+        try {
+            conversationBody = await conversationResponse.text();
+
+            // 检查是否有图片生成相关的内容 (dalle 工具调用或 file_ 文件引用)
+            // 注意：不使用 'image' 关键词，因为拒绝消息也会包含这个词
+            isImageGenerationStarted = conversationBody.includes('dalle') || conversationBody.includes('file_');
+            logger.debug('适配器', `isImageGenerationStarted: ${isImageGenerationStarted}`, meta);
+
+            // 提取文本内容
+            const lines = conversationBody.split('\n');
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                const dataStr = line.slice(6).trim();
+                if (dataStr === '[DONE]') continue;
+                try {
+                    const data = JSON.parse(dataStr);
+                    // 提取初始文本 (channel=final 的 assistant 消息)
+                    if (data.v?.message?.channel === 'final' &&
+                        data.v?.message?.author?.role === 'assistant' &&
+                        data.v?.message?.content?.parts?.length > 0) {
+                        const part = data.v.message.content.parts[0];
+                        if (typeof part === 'string') {
+                            conversationText = part;
+                        }
+                    }
+                    // patch 格式累加 (data.v 是 patch 操作数组)
+                    if (Array.isArray(data.v)) {
+                        for (const patch of data.v) {
+                            if (patch.o === 'append' && patch.p === '/message/content/parts/0' && patch.v) {
+                                conversationText += patch.v;
+                            }
+                        }
+                    }
+                } catch { }
+            }
+            logger.debug('适配器', `提取到文本 (${conversationText.length} 字符): ${conversationText.substring(0, 200)}...`, meta);
+        } catch (e) {
+            logger.warn('适配器', `解析 conversation 响应失败: ${e.message}`, meta);
+        }
+
+        // 早期检测：如果文本表明是拒绝/限流，立即返回，不等待图片超时
+        if (conversationText) {
+            // 检查是否是速率限制错误 (不重试，同账号重试也没用)
+            const isRateLimit = conversationBody.includes('RateLimitException') ||
+                conversationBody.includes('rate limit') ||
+                /limit.*reset/i.test(conversationText);
+
+            if (isRateLimit) {
+                logger.warn('适配器', `早期检测到速率限制: ${conversationText.substring(0, 200)}...`, meta);
+                return { error: `触发速率限制: ${conversationText.substring(0, 200)}`, retryable: false };
+            }
+
+            // 如果没有图片生成迹象，检查是否是内容被拒绝
+            if (!isImageGenerationStarted) {
+                const isContentRejection = /cannot|can't|unable|sorry|policy|violat/i.test(conversationText);
+                if (isContentRejection) {
+                    logger.warn('适配器', `早期检测到内容拒绝: ${conversationText.substring(0, 200)}...`, meta);
+                    return { error: `内容被拒绝: ${conversationText.substring(0, 200)}`, retryable: false };
+                }
+            }
+        }
+
         logger.info('适配器', '生成中，等待图片就绪...', meta);
 
         // 6. 监听文件状态接口，等待图片生成完成
-        // 通过 file_name 是否包含 .part 判断是否生成完成
+        // 如果 conversation 响应中没有图片生成迹象，使用较短超时
         let downloadUrl = null;
         let fileName = null;
+        const imageTimeout = isImageGenerationStarted ? 120000 : 30000;
 
         try {
             await page.waitForResponse(async (response) => {
@@ -128,11 +195,6 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                     const fn = json.file_name;
                     const dl = json.download_url;
 
-                    // 检查是否生成完成：
-                    // 1. 必须有 file_name
-                    // 2. file_name 开头必须是 user- (生成的图片)
-                    // 3. file_name 不能包含 .part（表示中间状态）
-                    // 4. 必须有 download_url
                     if (fn && fn.startsWith('user-') && !fn.includes('.part') && dl) {
                         fileName = fn;
                         downloadUrl = dl;
@@ -145,8 +207,34 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                 } catch {
                     return false;
                 }
-            }, { timeout: waitTimeout });
+            }, { timeout: imageTimeout });
         } catch (e) {
+            logger.debug('适配器', `等待图片超时, conversationText长度: ${conversationText.length}, downloadUrl: ${downloadUrl}`, meta);
+
+            // 超时时检查是否有 conversation 中的文本内容
+            if (conversationText && !downloadUrl) {
+                const isRateLimit = conversationBody.includes('RateLimitException') ||
+                    conversationBody.includes('rate limit') ||
+                    /limit.*reset/i.test(conversationText);
+
+                if (isRateLimit) {
+                    logger.warn('适配器', `触发速率限制: ${conversationText.substring(0, 200)}...`, meta);
+                    return { error: `触发速率限制: ${conversationText.substring(0, 200)}`, retryable: false };
+                }
+
+                logger.warn('适配器', `模型返回文本而非图片: ${conversationText.substring(0, 200)}...`, meta);
+                return { error: `模型返回文本而非图片: ${conversationText.substring(0, 200)}`, retryable: false };
+            }
+
+            // 如果没有提取到文本，但有原始响应体，尝试用简单方式提取
+            if (!conversationText && conversationBody) {
+                const partsMatch = conversationBody.match(/"parts":\s*\["([^"]+)"\]/);
+                if (partsMatch && partsMatch[1]) {
+                    logger.warn('适配器', `通过正则提取到文本: ${partsMatch[1].substring(0, 200)}...`, meta);
+                    return { error: `模型返回文本而非图片: ${partsMatch[1].substring(0, 200)}`, retryable: false };
+                }
+            }
+
             const pageError = normalizePageError(e, meta);
             if (pageError) return pageError;
             throw e;

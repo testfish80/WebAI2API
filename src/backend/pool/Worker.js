@@ -405,6 +405,7 @@ export class Worker {
 
         const maxAttempts = maxRetries === 0 ? candidateTypes.length : Math.min(maxRetries + 1, candidateTypes.length);
         let lastError = null;
+        let lastRetryable = undefined;
 
         for (let i = 0; i < maxAttempts; i++) {
             const { type, modelId: actualModelId } = candidateTypes[i];
@@ -415,12 +416,19 @@ export class Worker {
             }
 
             lastError = result.error;
+            lastRetryable = result.retryable;
+
+            // 如果明确标记为不可重试（如内容安全问题），立即返回
+            if (result.retryable === false) {
+                return { error: `所有支持该模型的适配器都无法使用: ${lastError}`, retryable: false };
+            }
+
             if (i < maxAttempts - 1) {
                 logger.warn('工作池', `[${this.name}] ${type} 失败，尝试下一个适配器...`, { error: lastError, ...meta });
             }
         }
 
-        return { error: `所有支持该模型的适配器都无法使用: ${lastError}` };
+        return { error: `所有支持该模型的适配器都无法使用: ${lastError}`, retryable: lastRetryable };
     }
 
     /**
@@ -479,10 +487,13 @@ export class Worker {
             userDataDir: this.userDataDir
         };
 
+        // 扩展 meta，添加 adapter 和 model 信息
+        const enrichedMeta = { ...meta, adapter: type, model: modelId };
+
         this.busyCount++;
         try {
             // 传递原始 modelId，由适配器自己解析
-            return await adapter.generate(subContext, prompt, paths, modelId, meta);
+            return await adapter.generate(subContext, prompt, paths, modelId, enrichedMeta);
         } finally {
             this.busyCount--;
         }

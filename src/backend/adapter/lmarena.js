@@ -40,6 +40,53 @@ function extractImage(text) {
     return null;
 }
 
+/**
+ * 从响应文本中提取错误信息
+ * SSE 错误格式:
+ * - a3: 模型提供方错误 (如 OpenAI moderation_blocked)
+ * - ae: Arena 平台错误 (如内容审核拦截)
+ * @param {string} text - 响应文本内容
+ * @returns {string|null} 提取到的错误信息，如果未找到则返回 null
+ */
+function extractError(text) {
+    if (!text) return null;
+    const lines = text.split('\n');
+    for (const line of lines) {
+        // a3: 模型提供方错误
+        if (line.startsWith('a3:')) {
+            try {
+                const errorMsg = JSON.parse(line.substring(3));
+                if (typeof errorMsg === 'string') {
+                    // 尝试提取嵌套的 JSON 错误
+                    const jsonMatch = errorMsg.match(/\{[\s\S]*"error"[\s\S]*\}/);
+                    if (jsonMatch) {
+                        try {
+                            const nested = JSON.parse(jsonMatch[0]);
+                            if (nested.error?.message) {
+                                return `[模型错误] ${nested.error.message} (code: ${nested.error.code || 'unknown'})`;
+                            }
+                        } catch { }
+                    }
+                    return `[模型错误] ${errorMsg}`;
+                }
+            } catch (e) { }
+        }
+        // ae: Arena 平台错误
+        if (line.startsWith('ae:')) {
+            try {
+                const errorData = JSON.parse(line.substring(3));
+                if (errorData?.message) {
+                    return `[平台错误] ${errorData.message}`;
+                }
+                if (typeof errorData === 'string') {
+                    return `[平台错误] ${errorData}`;
+                }
+            } catch (e) { }
+        }
+    }
+    return null;
+}
+
 
 /**
  * 执行生图任务
@@ -146,7 +193,14 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         const httpError = normalizeHttpError(response, content);
         if (httpError) {
             logger.error('适配器', `请求生成时返回错误: ${httpError.error}`, meta);
-            return { error: `请求生成时返回错误: ${httpError.error}` };
+            return { error: `请求生成时返回错误: ${httpError.error}`, retryable: httpError.retryable };
+        }
+
+        // 8.5 检查 SSE 错误 (a3/ae 行)
+        const sseError = extractError(content);
+        if (sseError) {
+            logger.warn('适配器', `SSE 错误: ${sseError}`, meta);
+            return { error: sseError, retryable: false };
         }
 
         // 9. 提取图片 URL
@@ -170,7 +224,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             return result;
         } else {
             logger.warn('适配器', '未获得结果，响应中无图片数据', { ...meta, preview: content.substring(0, 150) });
-            return { text: `未获得结果，响应中无图片数据: ${content}` };
+            return { error: `未获得结果，响应中无图片数据: ${content.substring(0, 200)}` };
         }
 
     } catch (err) {
