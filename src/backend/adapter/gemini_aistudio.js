@@ -1,6 +1,6 @@
 /**
  * @fileoverview Google AI Studio 文本生成适配器
- * 核心逻辑：使用用户提供的递归解析算法，针对 MakerSuite 响应格式优化
+ * 核心逻辑：使用新的递归解析算法，针对 MakerSuite 响应格式优化
  */
 
 import {
@@ -73,7 +73,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                 return result;
             }
         } catch (e) {
-            logger.warn('适配器', `API 拦截失败: ${e.message}，尝试 DOM 兜底`, meta);
+            logger.warn('适配器', `API 拦截失败: ${e.message}`, meta);
         }
 
     } catch (err) {
